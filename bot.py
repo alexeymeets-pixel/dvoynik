@@ -138,6 +138,29 @@ async def decline_friend(callback: types.CallbackQuery):
     await callback.message.edit_text("❌ Запрос отклонён.")
 
 
+
+@dp.message(F.voice)
+async def handle_voice(message: types.Message):
+    telegram_id = message.from_user.id
+    try:
+        file = await bot.get_file(message.voice.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=("voice.ogg", file_bytes, "audio/ogg"),
+            language="ru"
+        )
+        text = transcript.text.strip()
+        if not text:
+            await message.answer("Не смог разобрать голосовое — попробуй ещё раз.")
+            return
+        await message.answer(f"🎤 _{text}_", parse_mode="Markdown")
+        message.text = text
+        await handle_message(message)
+    except Exception as e:
+        logger.error(f"Voice error: {e}")
+        await message.answer("Не смог обработать голосовое. Попробуй текстом.")
+
 @dp.message(F.text)
 async def handle_message(message: types.Message):
     telegram_id = message.from_user.id
