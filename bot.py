@@ -154,7 +154,6 @@ async def handle_voice(message: types.Message):
         if not text:
             await message.answer("Не смог разобрать голосовое — попробуй ещё раз.")
             return
-        await message.answer(f"🎤 _{text}_", parse_mode="Markdown")
         await process_agent(message, telegram_id, text)
     except Exception as e:
         logger.error(f"Voice error: {e}")
