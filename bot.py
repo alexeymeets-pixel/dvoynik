@@ -155,8 +155,7 @@ async def handle_voice(message: types.Message):
             await message.answer("Не смог разобрать голосовое — попробуй ещё раз.")
             return
         await message.answer(f"🎤 _{text}_", parse_mode="Markdown")
-        message.text = text
-        await handle_message(message)
+        await process_agent(message, telegram_id, text)
     except Exception as e:
         logger.error(f"Voice error: {e}")
         await message.answer("Не смог обработать голосовое. Попробуй текстом.")
@@ -243,11 +242,14 @@ async def handle_message(message: types.Message):
             return
 
     # Обычный разговор
+    await process_agent(message, telegram_id, text)
+
+
+async def process_agent(message: types.Message, telegram_id: int, text: str):
     user = get_user(telegram_id)
     history = get_history(telegram_id)
     friends = get_friends(telegram_id)
 
-    # Формируем информацию о друзьях для агента
     if friends:
         friends_info = "\n".join([
             f"- {f['name']} ({f['sphere'] or 'сфера не указана'}, {f['city'] or 'город не указан'}), цель: {f['goal'] or 'не указана'}"
