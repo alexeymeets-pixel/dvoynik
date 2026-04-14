@@ -2,15 +2,16 @@ import os
 import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from datetime import datetime, date
 
 logger = logging.getLogger(__name__)
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 ALLOWED_FIELDS = {
     "name", "agent_name", "age_range", "city", "occupation",
     "sphere", "goal", "open_to_meet", "free_time", "proud_of",
-    "onboarding_done", "username", "preferred_places", "preferred_time"
+    "onboarding_done", "username", "preferred_places", "preferred_time",
+    "profile_notes"
 }
 
 def get_conn():
@@ -36,13 +37,13 @@ def init_db():
                 proud_of         TEXT,
                 preferred_places TEXT,
                 preferred_time   TEXT,
+                profile_notes    TEXT,
                 onboarding_done  INTEGER DEFAULT 0,
                 created_at       TIMESTAMP DEFAULT NOW()
             )
         ''')
-        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT")
-        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_places TEXT")
-        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_time TEXT")
+        for col in ["username", "preferred_places", "preferred_time", "profile_notes"]:
+            c.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} TEXT")
 
         c.execute('''
             CREATE TABLE IF NOT EXISTS messages (
@@ -69,7 +70,6 @@ def init_db():
                 UNIQUE(user_id, friend_id)
             )
         ''')
-        # Межагентные сообщения
         c.execute('''
             CREATE TABLE IF NOT EXISTS agent_messages (
                 id           SERIAL PRIMARY KEY,
@@ -79,6 +79,29 @@ def init_db():
                 message_type TEXT DEFAULT 'chat',
                 status       TEXT DEFAULT 'unread',
                 created_at   TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        # Календарь событий
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                id          SERIAL PRIMARY KEY,
+                telegram_id BIGINT,
+                title       TEXT,
+                event_date  DATE,
+                event_time  TEXT,
+                description TEXT,
+                reminded    BOOLEAN DEFAULT FALSE,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        # Заметки
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS notes (
+                id          SERIAL PRIMARY KEY,
+                telegram_id BIGINT,
+                content     TEXT,
+                tags        TEXT,
+                created_at  TIMESTAMP DEFAULT NOW()
             )
         ''')
         conn.commit()
@@ -113,8 +136,8 @@ def get_user_by_username(username):
 def save_user_field(telegram_id, field, value):
     if field not in ALLOWED_FIELDS:
         raise ValueError(f"Invalid field: {field}")
-    if isinstance(value, str) and len(value) > 500:
-        value = value[:500]
+    if isinstance(value, str) and len(value) > 1000:
+        value = value[:1000]
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -153,10 +176,7 @@ def save_message(telegram_id, role, content):
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute(
-            "INSERT INTO messages (telegram_id, role, content) VALUES (%s, %s, %s)",
-            (telegram_id, role, content)
-        )
+        c.execute("INSERT INTO messages (telegram_id, role, content) VALUES (%s, %s, %s)", (telegram_id, role, content))
         conn.commit()
     finally:
         conn.close()
@@ -166,10 +186,7 @@ def get_history(telegram_id, limit=20):
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute(
-            "SELECT role, content FROM messages WHERE telegram_id = %s ORDER BY created_at DESC LIMIT %s",
-            (telegram_id, limit)
-        )
+        c.execute("SELECT role, content FROM messages WHERE telegram_id = %s ORDER BY created_at DESC LIMIT %s", (telegram_id, limit))
         rows = c.fetchall()
         return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
     finally:
@@ -180,11 +197,7 @@ def send_friend_request(from_id, to_id):
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute('''
-            INSERT INTO friends (user_id, friend_id, status)
-            VALUES (%s, %s, 'pending')
-            ON CONFLICT (user_id, friend_id) DO NOTHING
-        ''', (from_id, to_id))
+        c.execute("INSERT INTO friends (user_id, friend_id, status) VALUES (%s, %s, 'pending') ON CONFLICT DO NOTHING", (from_id, to_id))
         conn.commit()
     finally:
         conn.close()
@@ -195,11 +208,7 @@ def accept_friend_request(from_id, to_id):
     try:
         c = conn.cursor()
         c.execute("UPDATE friends SET status = 'accepted' WHERE user_id = %s AND friend_id = %s", (from_id, to_id))
-        c.execute('''
-            INSERT INTO friends (user_id, friend_id, status)
-            VALUES (%s, %s, 'accepted')
-            ON CONFLICT (user_id, friend_id) DO UPDATE SET status = 'accepted'
-        ''', (to_id, from_id))
+        c.execute("INSERT INTO friends (user_id, friend_id, status) VALUES (%s, %s, 'accepted') ON CONFLICT (user_id, friend_id) DO UPDATE SET status = 'accepted'", (to_id, from_id))
         conn.commit()
     finally:
         conn.close()
@@ -210,10 +219,9 @@ def get_friends(telegram_id):
     try:
         c = conn.cursor(cursor_factory=RealDictCursor)
         c.execute('''
-            SELECT u.telegram_id, u.name, u.agent_name, u.city, u.sphere, u.goal, u.username,
-                   u.preferred_places, u.preferred_time
-            FROM friends f
-            JOIN users u ON u.telegram_id = f.friend_id
+            SELECT u.telegram_id, u.name, u.agent_name, u.city, u.sphere,
+                   u.goal, u.username, u.preferred_places, u.preferred_time
+            FROM friends f JOIN users u ON u.telegram_id = f.friend_id
             WHERE f.user_id = %s AND f.status = 'accepted'
         ''', (telegram_id,))
         return [dict(r) for r in c.fetchall()]
@@ -227,8 +235,7 @@ def get_pending_requests(telegram_id):
         c = conn.cursor(cursor_factory=RealDictCursor)
         c.execute('''
             SELECT u.telegram_id, u.name, u.agent_name, u.username
-            FROM friends f
-            JOIN users u ON u.telegram_id = f.user_id
+            FROM friends f JOIN users u ON u.telegram_id = f.user_id
             WHERE f.friend_id = %s AND f.status = 'pending'
         ''', (telegram_id,))
         return [dict(r) for r in c.fetchall()]
@@ -240,10 +247,7 @@ def send_agent_message(from_id, to_id, message, message_type="chat"):
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute('''
-            INSERT INTO agent_messages (from_user_id, to_user_id, message, message_type)
-            VALUES (%s, %s, %s, %s)
-        ''', (from_id, to_id, message, message_type))
+        c.execute("INSERT INTO agent_messages (from_user_id, to_user_id, message, message_type) VALUES (%s, %s, %s, %s)", (from_id, to_id, message, message_type))
         conn.commit()
     finally:
         conn.close()
@@ -255,8 +259,7 @@ def get_unread_agent_messages(telegram_id):
         c = conn.cursor(cursor_factory=RealDictCursor)
         c.execute('''
             SELECT am.*, u.name as from_name, u.agent_name as from_agent_name
-            FROM agent_messages am
-            JOIN users u ON u.telegram_id = am.from_user_id
+            FROM agent_messages am JOIN users u ON u.telegram_id = am.from_user_id
             WHERE am.to_user_id = %s AND am.status = 'unread'
             ORDER BY am.created_at ASC
         ''', (telegram_id,))
@@ -266,6 +269,88 @@ def get_unread_agent_messages(telegram_id):
             c.execute("UPDATE agent_messages SET status = 'read' WHERE id = ANY(%s)", (ids,))
             conn.commit()
         return rows
+    finally:
+        conn.close()
+
+
+# Календарь
+def add_event(telegram_id, title, event_date, event_time=None, description=None):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO events (telegram_id, title, event_date, event_time, description)
+            VALUES (%s, %s, %s, %s, %s)
+        ''', (telegram_id, title, event_date, event_time, description))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_upcoming_events(telegram_id, days=7):
+    conn = get_conn()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute('''
+            SELECT * FROM events
+            WHERE telegram_id = %s AND event_date >= CURRENT_DATE AND event_date <= CURRENT_DATE + %s
+            ORDER BY event_date ASC
+        ''', (telegram_id, days))
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_events_to_remind():
+    conn = get_conn()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute('''
+            SELECT e.*, u.telegram_id as user_telegram_id
+            FROM events e JOIN users u ON u.telegram_id = e.telegram_id
+            WHERE e.event_date = CURRENT_DATE + 1 AND e.reminded = FALSE
+        ''')
+        rows = [dict(r) for r in c.fetchall()]
+        if rows:
+            ids = [r['id'] for r in rows]
+            c.execute("UPDATE events SET reminded = TRUE WHERE id = ANY(%s)", (ids,))
+            conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def get_events_today():
+    conn = get_conn()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute('''
+            SELECT e.*, u.telegram_id as user_telegram_id
+            FROM events e JOIN users u ON u.telegram_id = e.telegram_id
+            WHERE e.event_date = CURRENT_DATE
+        ''')
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        conn.close()
+
+
+# Заметки
+def add_note(telegram_id, content, tags=None):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("INSERT INTO notes (telegram_id, content, tags) VALUES (%s, %s, %s)", (telegram_id, content, tags))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_notes(telegram_id, limit=10):
+    conn = get_conn()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT * FROM notes WHERE telegram_id = %s ORDER BY created_at DESC LIMIT %s", (telegram_id, limit))
+        return [dict(r) for r in c.fetchall()]
     finally:
         conn.close()
 
