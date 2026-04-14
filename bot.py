@@ -289,8 +289,26 @@ async def handle_message(message: types.Message):
     await message.answer(reply)
 
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass
+
 async def main():
     init_db()
+    # Запускаем HTTP сервер в отдельном потоке
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+    logger.info(f"Health check server on port {port}")
     logger.info("Бот запущен...")
     await dp.start_polling(bot)
 
