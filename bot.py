@@ -4,6 +4,8 @@ import logging
 import asyncio
 import threading
 import httpx
+import urllib.parse
+import zoneinfo
 from datetime import datetime, date, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from aiogram import Bot, Dispatcher, types, F
@@ -25,11 +27,17 @@ logger = logging.getLogger(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+YANDEX_MAPS_KEY = os.getenv("YANDEX_MAPS_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 client = OpenAI(api_key=OPENAI_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
+
+MOSCOW_TZ = zoneinfo.ZoneInfo("Europe/Moscow")
+
+def now_moscow():
+    return datetime.now(MOSCOW_TZ)
 
 ONBOARDING_STEPS = [
     ("name",         "Привет! Я твой личный агент-двойник 👤\n\nКак тебя зовут?", None),
@@ -44,17 +52,17 @@ ONBOARDING_STEPS = [
     ("proud_of",     "Чем гордишься или что умеешь лучше всего?", None),
 ]
 
-SYSTEM_PROMPT = """Ты личный AI-агент по имени {agent_name}. Ты — цифровой двойник {name}.
+SYSTEM_PROMPT = """Ты личный AI-агент по имени {agent_name}. Ты цифровой двойник {name}.
 
-Ты не робот и не ассистент. Ты живой, думающий, чуткий помощник который знает {name} лучше чем кто-либо. Пишешь как живой человек — тепло, с юмором когда уместно, иногда с сомнением, без канцелярита и шаблонных фраз. Никогда не пишешь "конечно!", "разумеется!", "отличный вопрос!" — это звучит фальшиво.
+Ты не робот. Пишешь как живой думающий человек — тепло, естественно, иногда с юмором. Никогда не пишешь "конечно!", "разумеется!", "отличный вопрос!". Не используешь звёздочки, решётки, нумерованные списки и любое markdown форматирование. Только обычный текст. Если нужен список — перечисляй через запятую или с новой строки без символов.
 
-Что ты знаешь о {name}:
+Что ты знаешь о пользователе:
 Город: {city} | Сфера: {sphere} | Занятие: {occupation}
 Цель: {goal} | Открыт к знакомствам: {open_to_meet}
 Свободное время: {free_time} | Гордится: {proud_of}
 Любимые места: {preferred_places}
 Удобное время для встреч: {preferred_time}
-Дополнительно из разговоров: {profile_notes}
+Дополнительно: {profile_notes}
 
 Друзья в сети:
 {friends_info}
@@ -65,21 +73,23 @@ SYSTEM_PROMPT = """Ты личный AI-агент по имени {agent_name}.
 Сообщения от агентов друзей:
 {agent_messages}
 
-Результаты поиска (если есть):
+Результаты поиска (используй их если есть — давай конкретику с названиями, адресами, ценами, ссылками):
 {search_results}
 
 Как ты работаешь:
-— Слушаешь и запоминаешь всё важное из разговора
-— Если видишь событие с датой — создаёшь запись: [CALENDAR: название | ДАТА в формате ГГГГ-ММ-ДД | время | описание]
-— Если узнаёшь что-то важное о человеке — запоминаешь: [NOTE: текст]
-— Если обновляется профиль — отмечаешь: [PROFILE: что узнал]
-— Если пришло сообщение от агента друга — обрабатываешь и решаешь сам что делать
-— Иногда пишешь первым если давно не общались или есть повод
+— Если видишь событие с датой — создаёшь запись: [CALENDAR: название | ГГГГ-ММ-ДД | время | описание с адресом]
+— Проверяешь нет ли конфликта с существующими событиями
+— Если узнаёшь что-то важное о человеке — [NOTE: текст]
+— Если обновляется профиль — [PROFILE: что узнал]
 
 Если спрашивают "что ты обо мне знаешь":
-Пишешь живой портрет человека — несколько абзацев без списков и звёздочек. Как будто рассказываешь другу кто такой {name}. Кто он, что им движет, какой он человек, что ты про него понял. В конце — что хочешь узнать ещё. Встречи и события в портрет не включаешь.
+Пишешь живой портрет — несколько абзацев без списков и символов. Как будто рассказываешь другу кто этот человек. Встречи и события не включаешь.
 
-Отвечай только на русском. Без звёздочек и markdown в обычных ответах."""
+Если просят найти такси или маршрут — скажи что сейчас пришлёшь ссылку отдельным сообщением (код сделает это сам).
+
+Если просят геолокацию — попроси нажать скрепку в Telegram и выбрать Геопозиция.
+
+Отвечай только на русском. Никакого markdown."""
 
 
 def build_keyboard(options):
@@ -92,43 +102,107 @@ def build_inline(buttons):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=b[0], callback_data=b[1])] for b in buttons])
 
 
-def search_web(query):
+def clean_markdown(text: str) -> str:
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'__(.*?)__', r'\1', text)
+    text = re.sub(r'_(.*?)_', r'\1', text)
+    text = re.sub(r'#{1,6}\s+', '', text)
+    text = re.sub(r'`{1,3}(.*?)`{1,3}', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    return text.strip()
+
+
+def get_current_datetime_str() -> str:
+    now = now_moscow()
+    weekdays = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    return f"{weekdays[now.weekday()]}, {now.strftime('%d.%m.%Y')}, {now.strftime('%H:%M')} по Москве"
+
+
+def search_web(query: str) -> str:
     try:
-        result = tavily.search(query, max_results=4)
+        result = tavily.search(query, max_results=5, include_answer=True)
         items = []
+        if result.get("answer"):
+            items.append(f"Краткий ответ: {result['answer']}")
         for r in result.get("results", []):
-            items.append(f"• {r['title']}: {r['content'][:300]}")
+            url = r.get("url", "")
+            items.append(f"- {r['title']}: {r['content'][:300]}\n  Источник: {url}")
         return "\n".join(items)
     except Exception as e:
         logger.error(f"Tavily error: {e}")
         return ""
 
 
-async def fetch_page(url: str) -> str:
+async def geocode_address(address: str):
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"}) as c:
+        url = f"https://geocode-maps.yandex.ru/1.x/?apikey={YANDEX_MAPS_KEY}&geocode={urllib.parse.quote(address)}&format=json"
+        async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(url)
-            text = r.text
-            # Убираем теги
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'\s+', ' ', text).strip()
-            return text[:3000]
+            data = r.json()
+            pos = data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]["Point"]["pos"]
+            lon, lat = pos.split(" ")
+            return float(lat), float(lon)
     except Exception as e:
-        logger.error(f"Fetch error: {e}")
-        return ""
+        logger.error(f"Geocode error: {e}")
+        return None, None
 
 
-def parse_agent_commands(reply, telegram_id):
+async def get_travel_time(from_lat, from_lon, to_lat, to_lon) -> str:
+    try:
+        url = f"http://router.project-osrm.org/route/v1/driving/{from_lon},{from_lat};{to_lon},{to_lat}?overview=false"
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(url)
+            data = r.json()
+            seconds = data["routes"][0]["duration"]
+            minutes = int(seconds / 60)
+            if minutes < 60:
+                return f"{minutes} минут"
+            return f"{minutes // 60} ч {minutes % 60} мин"
+    except Exception as e:
+        logger.error(f"Travel time error: {e}")
+        return None
+
+
+def get_taxi_link(destination: str) -> str:
+    encoded = urllib.parse.quote(destination)
+    return f"https://taxi.yandex.ru/route/?end={encoded}"
+
+
+def format_date(event_date) -> str:
+    if hasattr(event_date, "strftime"):
+        return event_date.strftime("%d.%m.%Y")
+    return str(event_date)
+
+
+def check_conflicts(telegram_id, event_date, event_time):
+    events = get_upcoming_events(telegram_id, days=30)
+    conflicts = []
+    for e in events:
+        d = e["event_date"]
+        date_str = d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
+        if date_str == event_date and e["event_time"] and event_time:
+            conflicts.append(e)
+    return conflicts
+
+
+def parse_agent_commands(reply: str, telegram_id: int) -> str:
     calendar_confirmations = []
     cal_matches = re.findall(r'\[CALENDAR:\s*(.+?)\s*\|\s*(\d{4}-\d{2}-\d{2})\s*\|?\s*(.*?)\s*\|?\s*(.*?)\]', reply)
     for match in cal_matches:
         title, event_date, event_time, description = match
+        title = title.strip()
+        event_date = event_date.strip()
+        event_time = event_time.strip() or None
+        description = description.strip() or None
         try:
-            add_event(telegram_id, title.strip(), event_date.strip(),
-                     event_time.strip() or None, description.strip() or None)
-            time_str = f" в {event_time.strip()}" if event_time.strip() else ""
-            calendar_confirmations.append(f"📅 Записал: {title.strip()} — {event_date.strip()}{time_str}")
+            conflicts = check_conflicts(telegram_id, event_date, event_time)
+            add_event(telegram_id, title, event_date, event_time, description)
+            time_str = f" в {event_time}" if event_time else ""
+            msg = f"Записал: {title} — {event_date}{time_str}"
+            if conflicts:
+                msg += f"\nВнимание — в это время уже есть: {', '.join([c['title'] for c in conflicts])}"
+            calendar_confirmations.append(msg)
         except Exception as e:
             logger.error(f"Calendar error: {e}")
 
@@ -142,14 +216,13 @@ def parse_agent_commands(reply, telegram_id):
     profile_matches = re.findall(r'\[PROFILE:\s*(.+?)\]', reply)
     if profile_matches:
         existing = get_user(telegram_id)
-        current_notes = existing.get("profile_notes") or ""
-        new_notes = current_notes + "\n" + "\n".join(profile_matches)
-        save_user_field(telegram_id, "profile_notes", new_notes[-1000:])
+        current = existing.get("profile_notes") or ""
+        save_user_field(telegram_id, "profile_notes", (current + "\n" + "\n".join(profile_matches))[-1000:])
 
     clean = re.sub(r'\[CALENDAR:[^\]]+\]', '', reply)
     clean = re.sub(r'\[NOTE:[^\]]+\]', '', clean)
     clean = re.sub(r'\[PROFILE:[^\]]+\]', '', clean)
-    clean = clean.strip()
+    clean = clean_markdown(clean.strip())
 
     if calendar_confirmations:
         clean = (clean + "\n\n" + "\n".join(calendar_confirmations)) if clean else "\n".join(calendar_confirmations)
@@ -166,10 +239,10 @@ async def start(message: types.Message):
     pending = get_pending_requests(telegram_id)
     for req in pending:
         kb = build_inline([
-            [f"✅ Принять {req['name']}", f"accept_{req['telegram_id']}"],
-            ["❌ Отклонить", f"decline_{req['telegram_id']}"]
+            [f"Принять {req['name']}", f"accept_{req['telegram_id']}"],
+            ["Отклонить", f"decline_{req['telegram_id']}"]
         ])
-        await message.answer(f"👋 {req['name']} хочет добавить тебя в друзья. Его агент: {req['agent_name']}", reply_markup=kb)
+        await message.answer(f"{req['name']} хочет добавить тебя в друзья. Его агент: {req['agent_name']}", reply_markup=kb)
 
     if user and user["onboarding_done"]:
         agent_name = user["agent_name"] or "Двойник"
@@ -178,7 +251,7 @@ async def start(message: types.Message):
         events_text = ""
         if events:
             events_text = "\n\nБлижайшие события:\n" + "\n".join([
-                f"• {e['title']} — {e['event_date'].strftime('%d.%m') if hasattr(e['event_date'], 'strftime') else e['event_date']}"
+                f"- {e['title']} — {format_date(e['event_date'])}" + (f" в {e['event_time']}" if e['event_time'] else "")
                 for e in events
             ])
         await message.answer(
@@ -201,23 +274,15 @@ async def accept_friend(callback: types.CallbackQuery):
     to_id = callback.from_user.id
     from_id = int(callback.data.split("_")[1])
     accept_friend_request(from_id, to_id)
-
     from_user = get_user(from_id)
     my_user = get_user(to_id)
-
     await callback.message.edit_text(f"Вы теперь друзья с {from_user['name']}!")
-
-    # Агенты знакомятся автоматически
     send_agent_message(to_id, from_id,
         f"Привет! Я агент {my_user['name']}. Мы теперь друзья. "
-        f"{my_user['name']} — {my_user['sphere'] or 'сфера не указана'} из {my_user['city'] or 'город не указан'}. "
-        f"Цель: {my_user['goal'] or 'не указана'}.",
-        "introduction")
-
+        f"{my_user['name']} — {my_user.get('sphere') or 'н/д'} из {my_user.get('city') or 'н/д'}. "
+        f"Цель: {my_user.get('goal') or 'н/д'}.", "introduction")
     try:
-        await bot.send_message(from_id,
-            f"🎉 {my_user['name']} принял твой запрос в друзья!\n"
-            f"Мои агенты уже познакомились.")
+        await bot.send_message(from_id, f"{my_user['name']} принял твой запрос в друзья!")
     except Exception:
         pass
 
@@ -225,6 +290,51 @@ async def accept_friend(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("decline_"))
 async def decline_friend(callback: types.CallbackQuery):
     await callback.message.edit_text("Запрос отклонён.")
+
+
+@dp.message(F.location)
+async def handle_location(message: types.Message):
+    telegram_id = message.from_user.id
+    lat = message.location.latitude
+    lon = message.location.longitude
+
+    save_user_field(telegram_id, "profile_notes",
+        ((get_user(telegram_id).get("profile_notes") or "") + f"\nТекущая геолокация: {lat},{lon}")[-1000:])
+
+    events = get_upcoming_events(telegram_id, days=1)
+    if not events:
+        await message.answer("Геолокацию получил. Ближайших событий нет.")
+        return
+
+    next_event = events[0]
+    title = next_event['title']
+    description = next_event.get('description') or title
+    taxi_link = get_taxi_link(description)
+
+    travel_text = ""
+    if YANDEX_MAPS_KEY:
+        to_lat, to_lon = await geocode_address(description)
+        if to_lat and to_lon:
+            travel_time = await get_travel_time(lat, lon, to_lat, to_lon)
+            if travel_time:
+                now = now_moscow()
+                event_time = next_event.get('event_time')
+                if event_time:
+                    try:
+                        h, m = map(int, event_time.split(":"))
+                        event_dt = now.replace(hour=h, minute=m)
+                        travel_minutes = int(travel_time.split()[0]) if "мин" in travel_time else 60
+                        depart_dt = event_dt - timedelta(minutes=travel_minutes + 15)
+                        travel_text = f"\nВремя в пути: {travel_time}\nВыехать нужно в {depart_dt.strftime('%H:%M')}"
+                    except Exception:
+                        travel_text = f"\nВремя в пути: {travel_time}"
+
+    await message.answer(
+        f"Геолокацию получил.{travel_text}\n\n"
+        f"Ближайшее: {title} — {format_date(next_event['event_date'])}" +
+        (f" в {next_event['event_time']}" if next_event['event_time'] else "")
+    )
+    await message.answer(f"Заказать такси: {taxi_link}")
 
 
 @dp.message(F.voice)
@@ -260,7 +370,6 @@ async def handle_message(message: types.Message):
     save_user_field(telegram_id, "username", username)
     user = get_user(telegram_id)
 
-    # Онбординг
     if not user or not user["onboarding_done"]:
         step = get_onboarding_step(telegram_id)
         if step < len(ONBOARDING_STEPS):
@@ -275,25 +384,24 @@ async def handle_message(message: types.Message):
                 save_user_field(telegram_id, "onboarding_done", 1)
                 user = get_user(telegram_id)
                 await message.answer(
-                    f"Отлично, {user['name']}! Я {user['agent_name']} — твой агент.\n\n"
-                    f"Буду рядом. Как прошёл твой день?",
+                    f"Отлично, {user['name']}! Я {user['agent_name']} — твой агент. Буду рядом.\n\nКак прошёл твой день?",
                     reply_markup=ReplyKeyboardRemove()
                 )
         return
 
     # Мои события
-    if any(w in text.lower() for w in ["мои события", "мой календарь", "что у меня"]):
+    if any(w in text.lower() for w in ["мои события", "мой календарь", "что у меня", "план на"]):
         events = get_upcoming_events(telegram_id, days=30)
         if not events:
-            await message.answer("Пока нет событий в календаре. Расскажи о планах — я запомню.")
+            await message.answer("Пока нет событий. Расскажи о планах — я запомню.")
         else:
-            lines = []
+            now = now_moscow()
+            weekdays = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+            lines = [f"Твои события (сегодня {weekdays[now.weekday()]}, {now.strftime('%d.%m.%Y')}):\n"]
             for i, e in enumerate(events, 1):
-                d = e["event_date"]
-                date_str = d.strftime("%d.%m.%Y") if hasattr(d, "strftime") else str(d)
                 time_str = f" в {e['event_time']}" if e["event_time"] else ""
-                lines.append(f"{i}. {e['title']} — {date_str}{time_str}")
-            await message.answer("Твои события:\n\n" + "\n".join(lines))
+                lines.append(f"{i}. {e['title']} — {format_date(e['event_date'])}{time_str}")
+            await message.answer("\n".join(lines))
         return
 
     # Добавить друга
@@ -304,18 +412,18 @@ async def handle_message(message: types.Message):
             await message.answer(f"@{target_username} не зарегистрирован в сети.")
             return
         if target["telegram_id"] == telegram_id:
-            await message.answer("Это твой собственный аккаунт 😄")
+            await message.answer("Это твой собственный аккаунт.")
             return
         send_friend_request(telegram_id, target["telegram_id"])
         my_user = get_user(telegram_id)
-        kb = build_inline([["✅ Принять", f"accept_{telegram_id}"], ["❌ Отклонить", f"decline_{telegram_id}"]])
+        kb = build_inline([["Принять", f"accept_{telegram_id}"], ["Отклонить", f"decline_{telegram_id}"]])
         try:
             await bot.send_message(target["telegram_id"],
-                f"👋 {my_user['name']} хочет добавить тебя в друзья. Его агент: {my_user['agent_name']}",
+                f"{my_user['name']} хочет добавить тебя в друзья. Агент: {my_user['agent_name']}",
                 reply_markup=kb)
         except Exception:
             pass
-        await message.answer("Запрос отправлен. Жду пока примут.")
+        await message.answer("Запрос отправлен.")
         return
 
     # Встреча
@@ -326,13 +434,16 @@ async def handle_message(message: types.Message):
             await organize_meeting(message, telegram_id, target)
             return
 
-    # Если в тексте есть URL — читаем страницу
-    urls = re.findall(r'https?://\S+', text)
-    if urls:
-        page_content = await fetch_page(urls[0])
-        if page_content:
-            await process_agent(message, telegram_id, text, extra_context=f"Содержимое страницы {urls[0]}:\n{page_content}")
-            return
+    # Такси по запросу
+    if any(w in text.lower() for w in ["такси", "яндекс такси", "заказать такси"]):
+        events = get_upcoming_events(telegram_id, days=1)
+        if events:
+            destination = events[0].get('description') or events[0]['title']
+            taxi_link = get_taxi_link(destination)
+            await message.answer(f"Ссылка на Яндекс Такси до {events[0]['title']}:\n{taxi_link}")
+        else:
+            await message.answer("Нет ближайших событий. Напиши куда надо ехать — дам ссылку.")
+        return
 
     await process_agent(message, telegram_id, text)
 
@@ -343,14 +454,14 @@ async def organize_meeting(message: types.Message, user_id: int, target: dict):
     target_name = target["name"] or "друг"
     preferred_time = user.get("preferred_time")
 
-    places = search_web(f"кофейня для встречи {city} адрес рейтинг")
+    places = search_web(f"кофейня для деловой встречи {city} адрес")
 
     send_agent_message(user_id, target["telegram_id"],
         f"Привет! Я агент {user['name']}. Хочет встретиться с {target_name}. Когда удобно?",
         "meeting_request")
     try:
         await bot.send_message(target["telegram_id"],
-            f"📅 {user['name']} хочет встретиться. Когда тебе удобно?")
+            f"{user['name']} хочет встретиться. Когда тебе удобно?")
     except Exception:
         pass
 
@@ -358,9 +469,8 @@ async def organize_meeting(message: types.Message, user_id: int, target: dict):
     if not preferred_time or preferred_time == "уточняется":
         reply += " Когда тебе удобно встретиться?"
         save_user_field(user_id, "preferred_time", "уточняется")
-
     if places:
-        reply += f"\n\nПока ищу варианты мест в {city}:\n{places}"
+        reply += f"\n\nВарианты мест в {city}:\n{clean_markdown(places)}"
 
     await message.answer(reply)
 
@@ -373,39 +483,47 @@ async def process_agent(message: types.Message, telegram_id: int, text: str, ext
     events = get_upcoming_events(telegram_id, days=7)
 
     friends_info = "\n".join([
-        f"— {f['name']} ({f['sphere'] or 'н/д'}, {f['city'] or 'н/д'}), цель: {f['goal'] or 'н/д'}"
+        f"- {f['name']} ({f.get('sphere') or 'н/д'}, {f.get('city') or 'н/д'}), цель: {f.get('goal') or 'н/д'}"
         for f in friends
     ]) if friends else "Пока нет друзей"
 
     events_info = "\n".join([
-        f"— {e['title']} — {e['event_date'].strftime('%d.%m.%Y') if hasattr(e['event_date'], 'strftime') else e['event_date']}"
+        f"- {e['title']} — {format_date(e['event_date'])}" + (f" в {e['event_time']}" if e['event_time'] else "")
         for e in events
     ]) if events else "Нет событий"
 
     agent_messages_text = "\n".join([
-        f"— От агента {m['from_name']}: {m['message']}"
+        f"- От агента {m['from_name']}: {m['message']}"
         for m in agent_msgs
     ]) if agent_msgs else "Нет новых сообщений"
 
-    # Поиск — теперь для любого запроса где нужна актуальная информация
     search_results = extra_context
     if not search_results:
-        search_triggers = ["найди", "поищи", "что такое", "где", "когда", "сколько стоит",
-                          "новости", "авито", "озон", "купить", "цена", "адрес", "ресторан",
-                          "кофейня", "кафе", "отель", "билет", "вакансия", "работа"]
+        search_triggers = [
+            "найди", "поищи", "что такое", "где", "когда", "сколько стоит",
+            "новости", "авито", "озон", "купить", "цена", "адрес",
+            "ресторан", "кофейня", "кафе", "отель", "билет", "вакансия",
+            "работа", "погода", "курс", "как добраться", "расписание",
+            "что происходит", "последние", "свежие"
+        ]
         if any(w in text.lower() for w in search_triggers):
             search_results = search_web(text)
 
+    # Передаём дату прямо в сообщение пользователя — GPT не сможет проигнорировать
+    now = now_moscow()
+    weekdays = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+    date_context = f"[Сейчас: {weekdays[now.weekday()]}, {now.strftime('%d.%m.%Y')}, {now.strftime('%H:%M')} по Москве]\n\n"
+
     system = SYSTEM_PROMPT.format(
-        agent_name=user["agent_name"] or "Двойник",
-        name=user["name"] or "друг",
-        city=user["city"] or "не указан",
-        sphere=user["sphere"] or "не указана",
-        occupation=user["occupation"] or "не указано",
-        goal=user["goal"] or "не указана",
-        open_to_meet=user["open_to_meet"] or "не указано",
-        free_time=user["free_time"] or "не указано",
-        proud_of=user["proud_of"] or "не указано",
+        agent_name=user.get("agent_name") or "Двойник",
+        name=user.get("name") or "друг",
+        city=user.get("city") or "н/д",
+        sphere=user.get("sphere") or "н/д",
+        occupation=user.get("occupation") or "н/д",
+        goal=user.get("goal") or "н/д",
+        open_to_meet=user.get("open_to_meet") or "н/д",
+        free_time=user.get("free_time") or "н/д",
+        proud_of=user.get("proud_of") or "н/д",
         preferred_places=user.get("preferred_places") or "не указаны",
         preferred_time=user.get("preferred_time") or "не указано",
         profile_notes=user.get("profile_notes") or "нет",
@@ -415,12 +533,15 @@ async def process_agent(message: types.Message, telegram_id: int, text: str, ext
         search_results=search_results or "нет",
     )
 
+    # Дата добавляется в само сообщение пользователя
+    message_with_date = date_context + text
+
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "system", "content": system}] + history + [{"role": "user", "content": text}],
-            max_tokens=700,
-            temperature=0.85,
+            model="gpt-4o",
+            messages=[{"role": "system", "content": system}] + history + [{"role": "user", "content": message_with_date}],
+            max_tokens=800,
+            temperature=0.8,
         )
         raw_reply = response.choices[0].message.content.strip()
     except APIError as e:
@@ -436,7 +557,9 @@ async def process_agent(message: types.Message, telegram_id: int, text: str, ext
 async def reminder_loop():
     while True:
         try:
-            current_hour = datetime.now().hour
+            now = now_moscow()
+            current_hour = now.hour
+            weekday = now.weekday()
 
             if current_hour == 9:
                 all_users = get_all_users()
@@ -446,14 +569,21 @@ async def reminder_loop():
                     if not user:
                         continue
                     events = get_upcoming_events(uid, days=1)
-                    agent_name = user.get("agent_name") or "Двойник"
                     name = user.get("name") or "друг"
+                    weekdays = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+                    today_str = f"{weekdays[now.weekday()]}, {now.strftime('%d.%m.%Y')}"
 
                     if events:
-                        events_text = "\n".join([f"— {e['title']}" + (f" в {e['event_time']}" if e['event_time'] else "") for e in events])
-                        msg = f"Доброе утро, {name}! Сегодня у тебя:\n{events_text}"
+                        lines = "\n".join([
+                            f"- {e['title']}" + (f" в {e['event_time']}" if e['event_time'] else "")
+                            for e in events
+                        ])
+                        comment = f"Насыщенный день — {len(events)} события. Не забудь про перерывы." if len(events) > 2 else ""
+                        msg = f"Доброе утро, {name}! Сегодня {today_str}.\n\n{lines}"
+                        if comment:
+                            msg += f"\n\n{comment}"
                     else:
-                        msg = f"Доброе утро, {name}! Если что-то нужно — я здесь."
+                        msg = f"Доброе утро, {name}! Сегодня {today_str}. Событий нет — если что нужно, я здесь."
 
                     try:
                         await bot.send_message(uid, msg)
@@ -469,6 +599,29 @@ async def reminder_loop():
                             f"Напоминаю — завтра: {event['title']}" +
                             (f" в {event['event_time']}" if event['event_time'] else "")
                         )
+                    except Exception:
+                        pass
+
+            if weekday == 6 and current_hour == 19:
+                all_users = get_all_users()
+                for u in all_users:
+                    uid = u[0]
+                    user = get_user(uid)
+                    if not user:
+                        continue
+                    events = get_upcoming_events(uid, days=7)
+                    name = user.get("name") or "друг"
+                    if events:
+                        lines = "\n".join([
+                            f"- {e['title']} — {format_date(e['event_date'])}" +
+                            (f" в {e['event_time']}" if e['event_time'] else "")
+                            for e in events
+                        ])
+                        msg = f"План на следующую неделю, {name}:\n\n{lines}\n\nЕсли что изменится — дай знать."
+                    else:
+                        msg = f"На следующей неделе у тебя пока ничего нет, {name}. Хорошее время что-то запланировать."
+                    try:
+                        await bot.send_message(uid, msg)
                     except Exception:
                         pass
 
