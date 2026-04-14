@@ -9,8 +9,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 ALLOWED_FIELDS = {
     "name", "agent_name", "age_range", "city", "occupation",
-    "sphere", "goal", "open_to_meet", "free_time", "proud_of", 
-    "onboarding_done", "username"
+    "sphere", "goal", "open_to_meet", "free_time", "proud_of",
+    "onboarding_done", "username", "preferred_places", "preferred_time"
 }
 
 def get_conn():
@@ -22,26 +22,28 @@ def init_db():
         c = conn.cursor()
         c.execute('''
             CREATE TABLE IF NOT EXISTS users (
-                telegram_id     BIGINT PRIMARY KEY,
-                username        TEXT,
-                name            TEXT,
-                agent_name      TEXT,
-                age_range       TEXT,
-                city            TEXT,
-                occupation      TEXT,
-                sphere          TEXT,
-                goal            TEXT,
-                open_to_meet    TEXT,
-                free_time       TEXT,
-                proud_of        TEXT,
-                onboarding_done INTEGER DEFAULT 0,
-                created_at      TIMESTAMP DEFAULT NOW()
+                telegram_id      BIGINT PRIMARY KEY,
+                username         TEXT,
+                name             TEXT,
+                agent_name       TEXT,
+                age_range        TEXT,
+                city             TEXT,
+                occupation       TEXT,
+                sphere           TEXT,
+                goal             TEXT,
+                open_to_meet     TEXT,
+                free_time        TEXT,
+                proud_of         TEXT,
+                preferred_places TEXT,
+                preferred_time   TEXT,
+                onboarding_done  INTEGER DEFAULT 0,
+                created_at       TIMESTAMP DEFAULT NOW()
             )
         ''')
-        # Добавляем username если колонки нет
-        c.execute('''
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT
-        ''')
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_places TEXT")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_time TEXT")
+
         c.execute('''
             CREATE TABLE IF NOT EXISTS messages (
                 id          SERIAL PRIMARY KEY,
@@ -57,7 +59,6 @@ def init_db():
                 step        INTEGER DEFAULT 0
             )
         ''')
-        # Таблица друзей
         c.execute('''
             CREATE TABLE IF NOT EXISTS friends (
                 id          SERIAL PRIMARY KEY,
@@ -66,6 +67,18 @@ def init_db():
                 status      TEXT DEFAULT 'pending',
                 created_at  TIMESTAMP DEFAULT NOW(),
                 UNIQUE(user_id, friend_id)
+            )
+        ''')
+        # Межагентные сообщения
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS agent_messages (
+                id           SERIAL PRIMARY KEY,
+                from_user_id BIGINT,
+                to_user_id   BIGINT,
+                message      TEXT,
+                message_type TEXT DEFAULT 'chat',
+                status       TEXT DEFAULT 'unread',
+                created_at   TIMESTAMP DEFAULT NOW()
             )
         ''')
         conn.commit()
@@ -181,12 +194,7 @@ def accept_friend_request(from_id, to_id):
     conn = get_conn()
     try:
         c = conn.cursor()
-        # Принимаем запрос
-        c.execute('''
-            UPDATE friends SET status = 'accepted'
-            WHERE user_id = %s AND friend_id = %s
-        ''', (from_id, to_id))
-        # Создаём обратную связь
+        c.execute("UPDATE friends SET status = 'accepted' WHERE user_id = %s AND friend_id = %s", (from_id, to_id))
         c.execute('''
             INSERT INTO friends (user_id, friend_id, status)
             VALUES (%s, %s, 'accepted')
@@ -202,7 +210,8 @@ def get_friends(telegram_id):
     try:
         c = conn.cursor(cursor_factory=RealDictCursor)
         c.execute('''
-            SELECT u.telegram_id, u.name, u.agent_name, u.city, u.sphere, u.goal, u.username
+            SELECT u.telegram_id, u.name, u.agent_name, u.city, u.sphere, u.goal, u.username,
+                   u.preferred_places, u.preferred_time
             FROM friends f
             JOIN users u ON u.telegram_id = f.friend_id
             WHERE f.user_id = %s AND f.status = 'accepted'
@@ -227,14 +236,45 @@ def get_pending_requests(telegram_id):
         conn.close()
 
 
+def send_agent_message(from_id, to_id, message, message_type="chat"):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO agent_messages (from_user_id, to_user_id, message, message_type)
+            VALUES (%s, %s, %s, %s)
+        ''', (from_id, to_id, message, message_type))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_unread_agent_messages(telegram_id):
+    conn = get_conn()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute('''
+            SELECT am.*, u.name as from_name, u.agent_name as from_agent_name
+            FROM agent_messages am
+            JOIN users u ON u.telegram_id = am.from_user_id
+            WHERE am.to_user_id = %s AND am.status = 'unread'
+            ORDER BY am.created_at ASC
+        ''', (telegram_id,))
+        rows = [dict(r) for r in c.fetchall()]
+        if rows:
+            ids = [r['id'] for r in rows]
+            c.execute("UPDATE agent_messages SET status = 'read' WHERE id = ANY(%s)", (ids,))
+            conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
 def get_all_users():
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("""
-            SELECT telegram_id, name, agent_name, city, occupation, sphere, goal
-            FROM users WHERE onboarding_done = 1
-        """)
+        c.execute("SELECT telegram_id, name, agent_name, city, occupation, sphere, goal FROM users WHERE onboarding_done = 1")
         return c.fetchall()
     finally:
         conn.close()
