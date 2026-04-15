@@ -14,7 +14,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from openai import OpenAI, APIError
 from tavily import TavilyClient
-from db import (init_db, get_user, get_user_by_username, save_user_field,
+from db import (init_db, get_conn, get_user, get_user_by_username, save_user_field,
                 get_onboarding_step, set_onboarding_step, save_message,
                 get_history, get_friends, get_pending_requests,
                 send_friend_request, accept_friend_request,
@@ -141,6 +141,31 @@ TOOLS = [
     }
 ]
 
+
+
+SEED_AGENTS = [
+    (9000000001, "dmitry_producer", "Дмитрий", "Дмитрий-Агент", "35–45", "Москва", "Предприниматель", "Кино и медиа", "Найти партнёра или команду", "Да, всегда", "Кино, театр", "Продюсер двух фильмов"),
+    (9000000002, "anna_designer", "Анна", "Анна-Агент", "25–35", "Санкт-Петербург", "Фрилансер", "Дизайн", "Найти клиентов", "Да, всегда", "Фото, выставки", "Работала с Яндекс и Сбер"),
+    (9000000003, "maxim_dev", "Максим", "Макс-Агент", "25–35", "Москва", "Фрилансер", "IT и разработка", "Найти партнёра или команду", "Только по делу", "Хакатоны, игры", "Разработал AI продукты"),
+    (9000000004, "olga_marketing", "Ольга", "Ольга-Агент", "35–45", "Москва", "Работаю в компании", "Маркетинг и PR", "Просто общаться", "Да, всегда", "Бег, подкасты", "15 лет в маркетинге"),
+    (9000000005, "ivan_investor", "Иван", "Иван-Агент", "35–45", "Москва", "Предприниматель", "Инвестиции", "Найти партнёра или команду", "Только по делу", "Теннис, чтение", "Вложил в 20 стартапов"),
+]
+
+def seed_agents():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        for a in SEED_AGENTS:
+            c.execute("""
+                INSERT INTO users (telegram_id, username, name, agent_name, age_range, city,
+                    occupation, sphere, goal, open_to_meet, free_time, proud_of, onboarding_done)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+                ON CONFLICT (telegram_id) DO NOTHING
+            """, a)
+        conn.commit()
+        logger.info(f"Seed agents added")
+    finally:
+        conn.close()
 
 def build_keyboard(options):
     if not options:
@@ -707,6 +732,7 @@ async def main():
     port = int(os.getenv("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    seed_agents()
     logger.info("Бот запущен...")
     asyncio.create_task(reminder_loop())
     await dp.start_polling(bot)
