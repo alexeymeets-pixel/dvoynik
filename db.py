@@ -363,3 +363,131 @@ def get_all_users():
         return c.fetchall()
     finally:
         conn.close()
+
+
+# Проекты
+def init_projects_and_tasks(conn_func):
+    conn = conn_func()
+    try:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS projects (
+                id          SERIAL PRIMARY KEY,
+                telegram_id BIGINT,
+                name        TEXT,
+                description TEXT,
+                status      TEXT DEFAULT 'active',
+                deadline    DATE,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS tasks (
+                id          SERIAL PRIMARY KEY,
+                telegram_id BIGINT,
+                project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+                title       TEXT,
+                priority    TEXT DEFAULT 'normal',
+                due_date    DATE,
+                status      TEXT DEFAULT 'active',
+                reminded_at TIMESTAMP,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def add_project(telegram_id, name, description=None, deadline=None):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO projects (telegram_id, name, description, deadline)
+            VALUES (%s, %s, %s, %s) RETURNING id
+        ''', (telegram_id, name, description, deadline))
+        pid = c.fetchone()[0]
+        conn.commit()
+        return pid
+    finally:
+        conn.close()
+
+
+def get_projects(telegram_id):
+    conn = get_conn()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT * FROM projects WHERE telegram_id = %s AND status = 'active' ORDER BY created_at DESC", (telegram_id,))
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_project_by_name(telegram_id, name):
+    conn = get_conn()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT * FROM projects WHERE telegram_id = %s AND LOWER(name) LIKE %s AND status = 'active'", (telegram_id, f"%{name.lower()}%"))
+        row = c.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def add_task(telegram_id, title, project_id=None, priority='normal', due_date=None):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO tasks (telegram_id, project_id, title, priority, due_date)
+            VALUES (%s, %s, %s, %s, %s) RETURNING id
+        ''', (telegram_id, project_id, title, priority, due_date))
+        tid = c.fetchone()[0]
+        conn.commit()
+        return tid
+    finally:
+        conn.close()
+
+
+def get_tasks(telegram_id, project_id=None):
+    conn = get_conn()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        if project_id:
+            c.execute("SELECT t.*, p.name as project_name FROM tasks t LEFT JOIN projects p ON p.id = t.project_id WHERE t.telegram_id = %s AND t.project_id = %s AND t.status = 'active' ORDER BY t.created_at DESC", (telegram_id, project_id))
+        else:
+            c.execute("SELECT t.*, p.name as project_name FROM tasks t LEFT JOIN projects p ON p.id = t.project_id WHERE t.telegram_id = %s AND t.status = 'active' ORDER BY p.name, t.created_at DESC", (telegram_id,))
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        conn.close()
+
+
+def complete_task(task_id):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE tasks SET status = 'done' WHERE id = %s", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_overdue_tasks():
+    conn = get_conn()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute('''
+            SELECT t.*, u.telegram_id as user_telegram_id
+            FROM tasks t JOIN users u ON u.telegram_id = t.telegram_id
+            WHERE t.status = 'active' AND t.due_date < CURRENT_DATE
+            AND (t.reminded_at IS NULL OR t.reminded_at < NOW() - INTERVAL '24 hours')
+        ''')
+        rows = [dict(r) for r in c.fetchall()]
+        if rows:
+            ids = [r['id'] for r in rows]
+            c.execute("UPDATE tasks SET reminded_at = NOW() WHERE id = ANY(%s)", (ids,))
+            conn.commit()
+        return rows
+    finally:
+        conn.close()
